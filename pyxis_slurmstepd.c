@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2019-2022, NVIDIA CORPORATION. All rights reserved.
  */
 
 #include <linux/limits.h>
@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <paths.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,20 +23,26 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <spank.h>
+#include <slurm/spank.h>
 
+#include "pyxis_slurmstepd.h"
 #include "common.h"
+#include "config.h"
+#include "args.h"
 #include "seccomp_filter.h"
-
-SPANK_PLUGIN(pyxis, 1)
-
-#define CONTAINER_NAME_FMT "%u.%u"
-#define PYXIS_SQUASHFS_FILE PYXIS_USER_RUNTIME_PATH "/" CONTAINER_NAME_FMT ".squashfs"
+#include "enroot.h"
 
 struct container {
 	char *name;
+	char *squashfs_path;
+	char *save_path;
+	bool reuse_rootfs;
+	bool reuse_ns;
+	bool temporary_squashfs;
+	bool temporary_rootfs;
 	int userns_fd;
 	int mntns_fd;
+	int cgroupns_fd;
 	int cwd_fd;
 };
 
@@ -44,266 +51,69 @@ struct job_info {
 	gid_t gid;
 	uint32_t jobid;
 	uint32_t stepid;
+	uint32_t local_task_count;
+	uint32_t total_task_count;
 	char **environ;
+	char cwd[PATH_MAX];
 };
 
-struct plugin_args {
-	char *docker_image;
-	char **mounts;
-	size_t mounts_len;
-	char *workdir;
-	char *container_name;
+struct shared_memory {
+	pthread_mutex_t mutex;
+	atomic_uint init_tasks;
+	atomic_uint started_tasks;
+	atomic_uint completed_tasks;
+	pid_t pid;
+	pid_t ns_pid;
 };
 
 struct plugin_context {
 	bool enabled;
 	int log_fd;
-	struct plugin_args args;
+	struct plugin_config config;
+	struct plugin_args *args;
 	struct job_info job;
 	struct container container;
 	int user_init_rv;
+	struct shared_memory *shm;
 };
 
 static struct plugin_context context = {
 	.enabled = false,
 	.log_fd = -1,
-	.args = { .docker_image = NULL, .mounts = NULL, .mounts_len = 0, .workdir = NULL, .container_name = NULL },
-	.job = { .uid = -1, .gid = -1, .jobid = 0, .stepid = 0 },
-	.container = { .name = NULL, .userns_fd = -1, .mntns_fd = -1, .cwd_fd = -1 },
+	.config = { .runtime_path = { 0 } },
+	.args = NULL,
+	.job = {
+		.uid = -1, .gid = -1, .jobid = 0, .stepid = 0,
+		.local_task_count = 0, .total_task_count = 0,
+		.environ = NULL, .cwd = { 0 }
+	},
+	.container = {
+		.name = NULL, .squashfs_path = NULL, .save_path = NULL,
+		.reuse_rootfs = false, .reuse_ns = false, .temporary_squashfs = false, .temporary_rootfs = false,
+		.userns_fd = -1, .mntns_fd = -1, .cgroupns_fd = -1, .cwd_fd = -1
+	},
 	.user_init_rv = 0,
 };
 
-static int spank_option_docker_image(int val, const char *optarg, int remote);
-static int spank_option_mount(int val, const char *optarg, int remote);
-static int spank_option_workdir(int val, const char *optarg, int remote);
-static int spank_option_container_name(int val, const char *optarg, int remote);
-
-struct spank_option spank_opts[] =
+static bool pyxis_execute_entrypoint(void)
 {
-	{
-		"container-image",
-		"[USER@][REGISTRY#]IMAGE[:TAG]",
-		"[pyxis] docker image to use, as an enroot URI",
-		1, 0, spank_option_docker_image
-	},
-	{
-		"container-mounts",
-		"SRC:DST[,SRC:DST...]",
-		"[pyxis] bind mount[s] inside the container",
-		1, 0, spank_option_mount
-	},
-	{
-		"container-workdir",
-		"PATH",
-		"[pyxis] working directory inside the container",
-		1, 0, spank_option_workdir
-	},
-	{
-		"container-name",
-		"NAME",
-		"[pyxis] name to use for saving and loading the container on the host. "
-			"Unnamed containers are removed after the slurm task is complete; named containers are not. "
-			"If a container with this name already exists, the existing container is used and the import is skipped.",
-		1, 0, spank_option_container_name
-	},
-	SPANK_OPTIONS_TABLE_END
-};
+	return context.args->entrypoint == 1 || (context.args->entrypoint == -1 && context.config.execute_entrypoint == true);
+}
 
-static int spank_option_docker_image(int val, const char *optarg, int remote)
+int pyxis_slurmstepd_init(spank_t sp, int ac, char **av)
 {
 	int ret;
 
-	if (optarg == NULL || *optarg == '\0') {
-		slurm_error("pyxis: --container-image: argument required");
-		return (-1);
-	}
-
-	/* SLURM can call us twice with the same value, check if it's a different value than before. */
-	if (context.args.docker_image != NULL) {
-		if (strcmp(context.args.docker_image + strlen("docker://"), optarg) == 0)
-			return (0);
-
-		slurm_error("pyxis: --container-image specified multiple times");
-		return (-1);
-	}
-
-	ret = asprintf(&context.args.docker_image, "docker://%s", optarg);
+	ret = pyxis_config_parse(&context.config, ac, av);
 	if (ret < 0) {
-		context.args.docker_image = NULL;
+		slurm_error("pyxis: failed to parse configuration");
 		return (-1);
 	}
 
-	return (0);
-}
-
-static int add_mount_entry(const char *entry)
-{
-	char **p;
-
-	for (int i = 0; i < context.args.mounts_len; ++i) {
-		/* This mount entry already exists, skip it. */
-		if (strcmp(context.args.mounts[i], entry) == 0) {
-			slurm_info("pyxis: skipping duplicate mount entry: %s", entry);
-			return (0);
-		}
-	}
-
-	p = realloc(context.args.mounts, sizeof(*context.args.mounts) * (context.args.mounts_len + 1));
-	if (p == NULL) {
-		slurm_error("pyxis: could not allocate memory");
+	context.args = pyxis_args_register(sp);
+	if (context.args == NULL) {
+		slurm_error("pyxis: failed to register arguments");
 		return (-1);
-	}
-
-	p[context.args.mounts_len] = strdup(entry);
-	if (p[context.args.mounts_len] == NULL) {
-		free(p);
-		return (-1);
-	}
-
-	context.args.mounts = p;
-	context.args.mounts_len += 1;
-
-	return (0);
-}
-
-static int add_mount(const char *source, const char *target)
-{
-	int ret;
-	char *entry = NULL;
-	int rv = -1;
-
-	ret = asprintf(&entry, "%s %s x-create=auto,rbind,rprivate", source, target);
-	if (ret < 0) {
-		slurm_error("pyxis: could not allocate memory");
-		goto fail;
-	}
-
-	ret = add_mount_entry(entry);
-	if (ret < 0)
-		goto fail;
-
-	rv = 0;
-
-fail:
-	free(entry);
-
-	return (rv);
-}
-
-static int spank_option_mount(int val, const char *optarg, int remote)
-{
-	int ret;
-	char *optarg_dup = NULL;
-	char *args, *arg, *src, *dst;
-	int rv = -1;
-
-	if (optarg == NULL || *optarg == '\0') {
-		slurm_error("pyxis: --container-mounts: argument required");
-		goto fail;
-	}
-
-	optarg_dup = strdup(optarg);
-	if (optarg_dup == NULL) {
-		slurm_error("pyxis: could not allocate memory");
-		goto fail;
-	}
-
-	args = optarg_dup;
-	while ((arg = strsep(&args, ",")) != NULL) {
-		dst = arg;
-		src = strsep(&dst, ":");
-		if (src == NULL || *src == '\0') {
-			slurm_error("pyxis: --container-mounts: invalid format");
-			goto fail;
-		}
-		if (dst == NULL || *dst == '\0') {
-			slurm_error("pyxis: --container-mounts: invalid format");
-			goto fail;
-		}
-
-		ret = add_mount(src, dst);
-		if (ret < 0) {
-			slurm_error("pyxis: could not add mount entry: %s:%s", src, dst);
-			goto fail;
-		}
-	}
-
-	rv = 0;
-
-fail:
-	free(optarg_dup);
-
-	return (rv);
-}
-
-static int spank_option_workdir(int val, const char *optarg, int remote)
-{
-	if (optarg == NULL || *optarg == '\0') {
-		slurm_error("pyxis: --container-workdir: argument required");
-		return (-1);
-	}
-
-	/* SLURM can call us twice with the same value, check if it's a different value than before. */
-	if (context.args.workdir != NULL) {
-		if (strcmp(context.args.workdir, optarg) == 0)
-			return (0);
-
-		slurm_error("pyxis: --container-workdir specified multiple times");
-		return (-1);
-	}
-
-	context.args.workdir = strdup(optarg);
-	return (0);
-}
-
-static int spank_option_container_name(int val, const char *optarg, int remote)
-{
-	if (optarg == NULL || *optarg == '\0') {
-		slurm_error("pyxis: --container-name: argument required");
-		return (-1);
-	}
-
-	/* SLURM can call us twice with the same value, check if it's a different value than before. */
-	if (context.args.container_name != NULL) {
-		if (strcmp(context.args.container_name, optarg) == 0)
-			return (0);
-
-		slurm_error("pyxis: --container-name specified multiple times");
-		return (-1);
-	}
-
-	context.args.container_name = strdup(optarg);
-	return (0);
-}
-
-int slurm_spank_init(spank_t sp, int ac, char **av)
-{
-	spank_err_t rc;
-
-	/* SLURM bug: see pyxis_slurmd.c */
-	if (spank_context() == S_CTX_SLURMD)
-		return slurm_spank_slurmd_init(sp, ac, av);
-
-	if (spank_context() != S_CTX_LOCAL && spank_context() != S_CTX_REMOTE)
-		return (0);
-
-	if (spank_context() == S_CTX_LOCAL) {
-		/*
-		 * Show slurm_info() messages by default.
-	         * Can get back to default slurm behavior by setting SLURMD_DEBUG=0.
-		 */
-		if (setenv("SLURMD_DEBUG", "1", 0) != 0) {
-			slurm_error("pyxis: failed to set SLURMD_DEBUG: %s", strerror(errno));
-			return (-1);
-		}
-	}
-
-	for (int i = 0; spank_opts[i].name != NULL; ++i) {
-		rc = spank_option_register(sp, &spank_opts[i]);
-		if (rc != ESPANK_SUCCESS) {
-			slurm_error("pyxis: couldn't register option %s: %s", spank_opts[i].name, spank_strerror(rc));
-			return (-1);
-		}
 	}
 
 	return (0);
@@ -338,10 +148,62 @@ static int job_get_info(spank_t sp, struct job_info *job)
 		goto fail;
 	}
 
-	rc = spank_get_item(sp, S_JOB_ENV, &job->environ);
+	rc = spank_get_item(sp, S_JOB_LOCAL_TASK_COUNT, &job->local_task_count);
+	if (rc != ESPANK_SUCCESS) {
+		slurm_error("pyxis: couldn't get job local task count: %s", spank_strerror(rc));
+		goto fail;
+	}
+
+	rc = spank_get_item(sp, S_JOB_TOTAL_TASK_COUNT, &job->total_task_count);
+	if (rc != ESPANK_SUCCESS) {
+		slurm_error("pyxis: couldn't get job total task count: %s", spank_strerror(rc));
+		goto fail;
+	}
+
+	/* This should probably be added to the API as a spank_item */
+	rc = spank_getenv(sp, "PWD", job->cwd, sizeof(job->cwd));
+	if (rc != ESPANK_SUCCESS)
+		slurm_info("pyxis: couldn't get job cwd path: %s", spank_strerror(rc));
+
+	rv = 0;
+
+fail:
+	return (rv);
+}
+
+static int job_get_env(spank_t sp, struct job_info *job)
+{
+	spank_err_t rc;
+	char **spank_environ = NULL;
+	size_t environ_len = 0;
+	int rv = -1;
+
+	rc = spank_get_item(sp, S_JOB_ENV, &spank_environ);
 	if (rc != ESPANK_SUCCESS) {
 		slurm_error("pyxis: couldn't get job environment: %s", spank_strerror(rc));
 		goto fail;
+	}
+
+	if (job->environ != NULL) {
+		for (int i = 0; job->environ[i] != NULL; ++i)
+			free(job->environ[i]);
+		free(job->environ);
+		job->environ = NULL;
+	}
+
+	/* We need to make a copy of the environment returned by the SPANK API. */
+	for (size_t i = 0; spank_environ[i] != NULL; ++i)
+		environ_len += 1;
+
+	job->environ = malloc((environ_len + 1) * sizeof(char*));
+	if (job->environ == NULL)
+		goto fail;
+	job->environ[environ_len] = NULL;
+
+	for (size_t i = 0; i < environ_len; ++i) {
+		job->environ[i] = strdup(spank_environ[i]);
+		if (job->environ[i] == NULL)
+			goto fail;
 	}
 
 	rv = 0;
@@ -356,7 +218,7 @@ static int enroot_create_user_runtime_dir(void)
 	int ret;
 	char path[PATH_MAX];
 
-	ret = snprintf(path, sizeof(path), PYXIS_USER_RUNTIME_PATH, context.job.uid);
+	ret = snprintf(path, sizeof(path), "%s/%u", context.config.runtime_path, context.job.uid);
 	if (ret < 0 || ret >= sizeof(path))
 		return (-1);
 
@@ -378,33 +240,15 @@ static int enroot_create_user_runtime_dir(void)
 	return (0);
 }
 
-static const char *static_mount_entries[] = {
-	"none /tmp x-detach,nofail,silent",
-	"/tmp /tmp x-create=dir,rw,bind,nosuid,nodev",
-	/* PMIX_SERVER_TMPDIR is the only PMIX variable set in the SPANK environment when calling enroot */
-	"${PMIX_SERVER_TMPDIR:-/dev/null} ${PMIX_SERVER_TMPDIR:-/dev/null} x-create=dir,rw,bind,nofail,silent",
-	NULL
-};
-
-
-int slurm_spank_init_post_opt(spank_t sp, int ac, char **av)
+int pyxis_slurmstepd_post_opt(spank_t sp, int ac, char **av)
 {
 	int ret;
 
-	if (context.args.docker_image == NULL && context.args.container_name == NULL) {
-		if (context.args.mounts_len > 0)
-			slurm_error("pyxis: ignoring --container-mounts because neither --container-image nor --container-name is set");
-		if (context.args.workdir != NULL)
-			slurm_error("pyxis: ignoring --container-workdir because neither --container-image nor --container-name is set");
+	if (!pyxis_args_enabled())
 		return (0);
-	}
 
 	context.enabled = true;
 
-	if (spank_context() != S_CTX_REMOTE)
-		return (0);
-
-	/* In slurmstepd context, create the user runtime directory and group cache directory. */
 	ret = job_get_info(sp, &context.job);
 	if (ret < 0)
 		return (-1);
@@ -413,234 +257,206 @@ int slurm_spank_init_post_opt(spank_t sp, int ac, char **av)
 	if (ret < 0)
 		return (-1);
 
-	for (int i = 0; static_mount_entries[i] != NULL; ++i) {
-		ret = add_mount_entry(static_mount_entries[i]);
-		if (ret < 0)
+	return (0);
+}
+
+static int enroot_new_log(void)
+{
+	xclose(context.log_fd);
+
+	/* We can use CLOEXEC here since we dup2(2) this file descriptor when needed. */
+	context.log_fd = pyxis_memfd_create("enroot-log", MFD_CLOEXEC);
+	if (context.log_fd < 0)
+		slurm_info("pyxis: couldn't create in-memory log file: %s", strerror(errno));
+
+	return (context.log_fd);
+}
+
+/*
+ * List of environment variables that should not be passed from the Slurm job to enroot.
+ */
+
+#define PYXIS_ENV_ENTRY(s) { s, sizeof(s) - 1 }
+static const struct {
+	const char *name;
+	size_t len;
+} enroot_deny_env[] = {
+	PYXIS_ENV_ENTRY("PATH="),
+	PYXIS_ENV_ENTRY("LD_LIBRARY_PATH="),
+	PYXIS_ENV_ENTRY("LD_PRELOAD="),
+	PYXIS_ENV_ENTRY("SLURM_PROCID="),
+	PYXIS_ENV_ENTRY("SLURM_LOCALID="),
+	PYXIS_ENV_ENTRY("SLURM_TASK_PID="),
+	PYXIS_ENV_ENTRY("PMIX_RANK="),
+	PYXIS_ENV_ENTRY("PMI_FD="),
+	PYXIS_ENV_ENTRY("ENROOT_LIBRARY_PATH="),
+	PYXIS_ENV_ENTRY("ENROOT_SYSCONF_PATH="),
+	PYXIS_ENV_ENTRY("ENROOT_RUNTIME_PATH="),
+	PYXIS_ENV_ENTRY("ENROOT_CACHE_PATH="),
+	PYXIS_ENV_ENTRY("ENROOT_DATA_PATH="),
+	PYXIS_ENV_ENTRY("ENROOT_TEMP_PATH="),
+	PYXIS_ENV_ENTRY("ENROOT_ZSTD_OPTIONS="),
+	PYXIS_ENV_ENTRY("ENROOT_TRANSFER_RETRIES="),
+	PYXIS_ENV_ENTRY("ENROOT_CONNECT_TIMEOUT="),
+	PYXIS_ENV_ENTRY("ENROOT_TRANSFER_TIMEOUT="),
+	PYXIS_ENV_ENTRY("ENROOT_MAX_CONNECTIONS="),
+	PYXIS_ENV_ENTRY("ENROOT_ALLOW_HTTP="),
+	{ NULL, 0 }
+};
+#undef PYXIS_ENV_ENTRY
+
+static int try_import_env(char *string)
+{
+	for (int i = 0; enroot_deny_env[i].name != NULL; ++i) {
+		if (strncmp(string, enroot_deny_env[i].name, enroot_deny_env[i].len) == 0)
+			return (0);
+	}
+
+	if (putenv(string) < 0)
+		return (-1);
+
+	return (0);
+}
+
+static int enroot_import_job_env(char **env)
+{
+	if (env == NULL)
+		return (-1);
+
+	/* Import all allowed environment variables from the job */
+	for (int i = 0; env[i]; ++i) {
+		if (try_import_env(env[i]) < 0)
 			return (-1);
 	}
 
 	return (0);
 }
 
-static void enroot_reset_log(void)
+static int enroot_set_env(void)
 {
-	xclose(context.log_fd);
+	if (enroot_import_job_env(context.job.environ) < 0)
+		return (-1);
 
-	// We can use CLOEXEC here since we dup2(2) this file descriptor when needed.
-	#ifdef HAVE_MEMFD_CREATE
-	context.log_fd = memfd_create("enroot-log", MFD_CLOEXEC);
-	#else
-	context.log_fd = shm_open("/enroot-log", O_RDWR | O_CREAT | O_EXCL | FD_CLOEXEC, S_IRWXU);
-	#endif
-	if (context.log_fd < 0)
-		slurm_info("pyxis: couldn't create in-memory log file: %s", strerror(errno));
+	if (context.args->mount_home == 0) {
+		if (setenv("ENROOT_MOUNT_HOME", "n", 1) < 0)
+			return (-1);
+	} else if (context.args->mount_home == 1) {
+		if (setenv("ENROOT_MOUNT_HOME", "y", 1) < 0)
+			return (-1);
+	} else {
+		/* If mount_home was not set by the user, we rely on the setting specified in the enroot config. */
+	}
 
-	return;
+	if (context.args->remap_root == 0) {
+		if (setenv("ENROOT_REMAP_ROOT", "n", 1) < 0)
+			return (-1);
+	} else if (context.args->remap_root == 1) {
+		if (setenv("ENROOT_REMAP_ROOT", "y", 1) < 0)
+			return (-1);
+	} else {
+		/* If remap_root was not set by the user, we rely on the setting specified in the enroot config. */
+	}
+
+	if (context.args->writable == 0) {
+		if (setenv("ENROOT_ROOTFS_WRITABLE", "n", 1) < 0)
+			return (-1);
+	} else if (context.args->writable == 1) {
+		if (setenv("ENROOT_ROOTFS_WRITABLE", "y", 1) < 0)
+			return (-1);
+	} else {
+		/* If writable/readonly was not set by the user, we rely on the setting specified in the enroot config. */
+	}
+
+	return (0);
 }
 
-static void enroot_print_last_log(void)
+static pid_t enroot_exec_ctx(char *const argv[])
 {
-	int ret;
+	return enroot_exec(context.job.uid, context.job.gid, enroot_new_log(), enroot_set_env, argv);
+}
+
+static int enroot_exec_wait_ctx(char *const argv[])
+{
+	return enroot_exec_wait(context.job.uid, context.job.gid, enroot_new_log(), enroot_set_env, argv);
+}
+
+static FILE *enroot_exec_output_ctx(char *const argv[])
+{
+	return enroot_exec_output(context.job.uid, context.job.gid, enroot_set_env, argv);
+}
+
+static void enroot_print_log_ctx(void)
+{
+	if (context.log_fd >= 0) {
+		enroot_print_log(context.log_fd);
+		xclose(context.log_fd);
+		context.log_fd = -1;
+	}
+}
+
+/*
+ * Returns -1 if an error occurs.
+ * Returns 0 and set *pid==-1 if container doesn't exist.
+ * Returns 0 and set *pid==0 if container exists but is not running.
+ * Returns 0 and set *pid>0 (the container PID) if the container exists and is running.
+ */
+static int enroot_container_get(const char *name, pid_t *pid)
+{
 	FILE *fp;
-	char *line = NULL;
-	size_t len = 0;
-	ssize_t read;
+	char *line;
+	char *ctr_name, *ctr_pid, *saveptr;
+	unsigned long n;
+	int rv = -1;
 
-	ret = lseek(context.log_fd, 0, SEEK_SET);
-	if (ret < 0) {
-		slurm_info("pyxis: couldn't rewind log file: %s", strerror(errno));
-		return;
-	}
+	if (name == NULL || strlen(name) == 0 || pid == NULL)
+		return (-1);
 
-	fp = fdopen(context.log_fd, "r");
+	*pid = -1;
+
+	fp = enroot_exec_output_ctx((char *const[]){ "enroot", "list", "-f", NULL });
 	if (fp == NULL) {
-		slurm_info("pyxis: couldn't open in-memory log for printing: %s", strerror(errno));
-		return;
-	}
-	context.log_fd = -1;
-
-	slurm_info("pyxis: printing contents of log file ...");
-	while ((read = getline(&line, &len, fp)) != -1) {
-		len = strlen(line);
-		if (len > 0) {
-			if (line[len - 1] == '\n')
-				line[len - 1] = '\0'; /* trim trailing newline */
-			slurm_error("pyxis:     %s", line);
-		}
-	}
-
-	free(line);
-	fclose(fp);
-	return;
-}
-
-static const char *enroot_want_env[] = {
-	"HOME=",
-	"NVIDIA_VISIBLE_DEVICES=",
-	"MELLANOX_VISIBLE_DEVICES=",
-	"ENROOT_CONFIG_PATH=",
-	"SLURM_",
-	NULL
-};
-
-static int enroot_import_job_env(char **env)
-{
-	for (int i = 0; env[i]; ++i)
-		for (int j = 0; enroot_want_env[j]; ++j)
-			if (strncmp(env[i], enroot_want_env[j], strlen(enroot_want_env[j])) == 0)
-				if (putenv(env[i]) < 0)
-					return (-1);
-
-	return (0);
-}
-
-static pid_t enroot_exec(uid_t uid, gid_t gid, char *const argv[])
-{
-	int ret;
-	int null_fd = -1;
-	int target_fd = -1;
-	pid_t pid;
-
-	enroot_reset_log();
-
-	pid = fork();
-	if (pid < 0) {
-		slurm_error("pyxis: fork error: %s", strerror(errno));
+		slurm_error("pyxis: couldn't get list of existing container filesystems");
 		return (-1);
 	}
 
-	if (pid == 0) {
-		null_fd = open(_PATH_DEVNULL, O_RDWR);
-		if (null_fd < 0)
-			_exit(EXIT_FAILURE);
-
-		ret = dup2(null_fd, STDIN_FILENO);
-		if (ret < 0)
-			_exit(EXIT_FAILURE);
-
-		/* Redirect stdout/stderr to the log file or /dev/null */
-		if (context.log_fd >= 0)
-			target_fd = context.log_fd;
-		else
-			target_fd = null_fd;
-
-		ret = dup2(target_fd, STDOUT_FILENO);
-		if (ret < 0)
-			_exit(EXIT_FAILURE);
-
-		ret = dup2(target_fd, STDERR_FILENO);
-		if (ret < 0)
-			_exit(EXIT_FAILURE);
-
-		ret = setregid(gid, gid);
-		if (ret < 0)
-			_exit(EXIT_FAILURE);
-
-		ret = setreuid(uid, uid);
-		if (ret < 0)
-			_exit(EXIT_FAILURE);
-
-		ret = enroot_import_job_env(context.job.environ);
-		if (ret < 0)
-			_exit(EXIT_FAILURE);
-
-		execvpe("enroot", argv, environ);
-
-		_exit(EXIT_FAILURE);
+	/* Skip headers line */
+	line = get_line_from_file(fp);
+	if (line == NULL) {
+		slurm_error("pyxis: \"enroot list -f\" did not produce any usable output");
+		goto fail;
 	}
 
-	return (pid);
-}
+	while ((line = get_line_from_file(fp)) != NULL) {
+		ctr_name = strtok_r(line, " ", &saveptr);
+		if (ctr_name == NULL || *ctr_name == '\0')
+			goto fail;
 
-static int child_wait(pid_t pid)
-{
-	int status;
-	int ret;
+		if (strcmp(name, ctr_name) == 0) {
+			ctr_pid = strtok_r(NULL, " ", &saveptr);
+			if (ctr_pid == NULL || *ctr_pid == '\0') {
+				*pid = 0;
+			} else {
+				errno = 0;
+				n = strtoul(ctr_pid, NULL, 10);
+				if (errno != 0 || n != (pid_t)n)
+					goto fail;
 
-	ret = waitpid(pid, &status, 0);
-	if (ret < 0) {
-		slurm_error("pyxis: could not wait for child %d: %s", pid, strerror(errno));
-		return (-1);
-	}
-
-	if (WIFSIGNALED(status)) {
-		slurm_error("pyxis: child %d terminated with signal %d", pid, WTERMSIG(status));
-		return (-1);
-	}
-
-	if (WIFEXITED(status) && (status = WEXITSTATUS(status)) != 0) {
-		slurm_error("pyxis: child %d failed with error code: %d", pid, status);
-		return (-1);
-	}
-
-	return (0);
-}
-
-static int enroot_exec_wait(uid_t uid, gid_t gid, char *const argv[])
-{
-	int ret;
-	pid_t child;
-
-	child = enroot_exec(uid, gid, argv);
-	if (child < 0)
-		return (-1);
-
-	ret = child_wait(child);
-	if (ret < 0)
-		return (-1);
-
-	return (0);
-}
-
-static bool enroot_check_container_exists(const char *name)
-{
-	int ret;
-	FILE *fp;
-	char *line = NULL;
-	size_t len = 0;
-	ssize_t read;
-	bool rc = false;
-
-	if (name == NULL || strlen(name) == 0)
-		return (false);
-
-	slurm_debug("pyxis: running \"enroot list\" to check whether a container with name \"%s\" exists", name);
-	ret = enroot_exec_wait(context.job.uid, context.job.gid, (char *const[]){ "enroot", "list", NULL });
-	if (ret < 0) {
-		slurm_error("pyxis: enroot list failed");
-		enroot_print_last_log();
-		return (false);
-	}
-
-	/* Typically, the log is used to show stderr from failed commands. But here we parse the output. */
-	ret = lseek(context.log_fd, 0, SEEK_SET);
-	if (ret < 0) {
-		slurm_info("pyxis: couldn't rewind log file: %s", strerror(errno));
-		return (false);
-	}
-
-	fp = fdopen(context.log_fd, "r");
-	if (fp == NULL) {
-		slurm_info("pyxis: couldn't open in-memory log for printing: %s", strerror(errno));
-		return (false);
-	}
-	context.log_fd = -1;
-
-	while ((read = getline(&line, &len, fp)) != -1) {
-		len = strlen(line);
-		if (len > 0) {
-			if (line[len - 1] == '\n')
-				line[len - 1] = '\0'; /* trim trailing newline */
-			if (strcmp(line, name) == 0) {
-				rc = true;
-				break;
+				*pid = (pid_t)n;
 			}
+
+			break;
 		}
+
+		free(line);
+		line = NULL;
 	}
 
+	rv = 0;
+
+fail:
 	free(line);
-	fclose(fp);
-	return (rc);
+	if (fp) fclose(fp);
+	return (rv);
 }
 
 static int read_proc_environ(pid_t pid, char **result, size_t *size)
@@ -711,7 +527,7 @@ static int spank_import_container_env(spank_t sp, pid_t pid)
 
 	ret = read_proc_environ(pid, &proc_environ, &size);
 	if (ret < 0) {
-		slurm_error("pyxis: couldn't read /proc/<pid>/environ");
+		slurm_error("pyxis: couldn't read /proc/%d/environ", pid);
 		goto fail;
 	}
 
@@ -736,91 +552,87 @@ fail:
 	return (rv);
 }
 
-static int enroot_container_create(spank_t sp)
+static int enroot_container_create(void)
 {
 	int ret;
-	char squashfs_path[PATH_MAX] = { 0 };
+	char *enroot_uri = NULL;
 	int rv = -1;
 
-	ret = snprintf(squashfs_path, sizeof(squashfs_path), PYXIS_SQUASHFS_FILE, context.job.uid, context.job.jobid, context.job.stepid);
-	if (ret < 0 || ret >= sizeof(squashfs_path))
-		goto fail;
-
-	slurm_info("pyxis: running \"enroot import\" ...");
-
-	ret = enroot_exec_wait(context.job.uid, context.job.gid,
-			       (char *const[]){ "enroot", "import", "--output", squashfs_path, context.args.docker_image, NULL });
-	if (ret < 0) {
-		slurm_error("pyxis: enroot import failed");
-		enroot_print_last_log();
-		return (-1);
-	}
-
-	if (context.args.container_name == NULL) {
-		ret = asprintf(&context.container.name, CONTAINER_NAME_FMT, context.job.jobid, context.job.stepid);
+	if (context.container.temporary_squashfs) {
+		/* Assume `image` is an enroot URI for a docker image. */
+		ret = xasprintf(&enroot_uri, "docker://%s", context.args->image);
 		if (ret < 0)
 			goto fail;
-	} else {
-		context.container.name = strdup(context.args.container_name);
+
+		/* Be more verbose if there is a single task in the job, it might be interactive */
+		if (context.job.total_task_count == 1)
+			slurm_spank_log("pyxis: importing docker image: %s", context.args->image);
+
+		ret = enroot_exec_wait_ctx((char *const[]){ "enroot", "import", "--output", context.container.squashfs_path, enroot_uri, NULL });
+		if (ret < 0) {
+			slurm_error("pyxis: failed to import docker image");
+			enroot_print_log_ctx();
+			goto fail;
+		}
+		slurm_spank_log("pyxis: imported docker image: %s", context.args->image);
 	}
 
-	slurm_info("pyxis: running \"enroot create\" ...");
+	slurm_info("pyxis: creating container filesystem: %s", context.container.name);
 
-	ret = enroot_exec_wait(context.job.uid, context.job.gid,
-			       (char *const[]){ "enroot", "create", "--name", context.container.name, squashfs_path, NULL });
+	ret = enroot_exec_wait_ctx((char *const[]){ "enroot", "create", "--name", context.container.name, context.container.squashfs_path, NULL });
 	if (ret < 0) {
-		slurm_error("pyxis: enroot create failed");
-		enroot_print_last_log();
+		slurm_error("pyxis: failed to create container filesystem");
+		enroot_print_log_ctx();
 		goto fail;
 	}
 
 	rv = 0;
 
 fail:
-	if (*squashfs_path != '\0') {
-		ret = unlink(squashfs_path);
+	free(enroot_uri);
+	if (context.container.temporary_squashfs) {
+		ret = unlink(context.container.squashfs_path);
 		if (ret < 0)
-			slurm_info("pyxis: could not remove squashfs: %s", strerror(errno));
+			slurm_info("pyxis: could not remove squashfs %s: %s", context.container.squashfs_path, strerror(errno));
 	}
 
 	return (rv);
 }
 
-static int container_get_fds(pid_t pid, struct container *container)
+static int container_get_namespaces(pid_t pid, struct container *container)
 {
 	int ret;
-	char userns_path[PATH_MAX];
-	char mntns_path[PATH_MAX];
-	char cwd_path[PATH_MAX];
+	char path[PATH_MAX];
 	int rv = -1;
 
-	ret = snprintf(userns_path, sizeof(userns_path), "/proc/%d/ns/user", pid);
-	if (ret < 0 || ret >= sizeof(userns_path))
+	ret = snprintf(path, sizeof(path), "/proc/%d/ns/user", pid);
+	if (ret < 0 || ret >= sizeof(path))
 		goto fail;
 
-	container->userns_fd = open(userns_path, O_RDONLY | O_CLOEXEC);
+	container->userns_fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (container->userns_fd < 0) {
 		slurm_error("pyxis: unable to open user namespace file: %s", strerror(errno));
 		goto fail;
 	}
 
-	ret = snprintf(mntns_path, sizeof(mntns_path), "/proc/%d/ns/mnt", pid);
-	if (ret < 0 || ret >= sizeof(mntns_path))
+	ret = snprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
+	if (ret < 0 || ret >= sizeof(path))
 		goto fail;
 
-	container->mntns_fd = open(mntns_path, O_RDONLY | O_CLOEXEC);
+	container->mntns_fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (container->mntns_fd < 0) {
 		slurm_error("pyxis: unable to open mount namespace file: %s", strerror(errno));
 		goto fail;
 	}
 
-	ret = snprintf(cwd_path, sizeof(cwd_path), "/proc/%d/cwd", pid);
-	if (ret < 0 || ret >= sizeof(cwd_path))
+	ret = snprintf(path, sizeof(path), "/proc/%d/ns/cgroup", pid);
+	if (ret < 0 || ret >= sizeof(path))
 		goto fail;
 
-	container->cwd_fd = open(cwd_path, O_RDONLY | O_CLOEXEC);
-	if (container->cwd_fd < 0) {
-		slurm_error("pyxis: couldn't open cwd fd");
+	container->cgroupns_fd = open(path, O_RDONLY | O_CLOEXEC);
+	/* Skip cgroup namespace if not supported */
+	if (container->cgroupns_fd < 0 && errno != ENOENT) {
+		slurm_error("pyxis: unable to open cgroup namespace file: %s", strerror(errno));
 		goto fail;
 	}
 
@@ -830,77 +642,113 @@ fail:
 	return (rv);
 }
 
-static int enroot_create_start_config(void)
+static int container_get_cwd(pid_t pid, struct container *container)
 {
+	int ret;
+	char path[PATH_MAX];
+
+	ret = snprintf(path, sizeof(path), "/proc/%d/cwd", pid);
+	if (ret < 0 || ret >= sizeof(path))
+		return (-1);
+
+	container->cwd_fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (container->cwd_fd < 0) {
+		slurm_error("pyxis: couldn't open cwd fd");
+		return (-1);
+	}
+
+	return (0);
+}
+
+static int enroot_create_start_config(char (*path)[PATH_MAX])
+{
+	int ret;
 	int fd = -1;
-	int dup_fd = -1;
 	FILE *f = NULL;
 	char template[] = "/tmp/.enroot_config_XXXXXX";
-	int ret;
+	char *line = NULL;
 	int rv = -1;
 
 	fd = mkstemp(template);
 	if (fd < 0)
 		goto fail;
 
-	dup_fd = dup(fd);
-	if (dup_fd < 0)
-		goto fail;
-
-	f = fdopen(dup_fd, "a");
+	f = fdopen(fd, "a+");
 	if (f == NULL)
 		goto fail;
-	dup_fd = -1;
 
-	ret = fprintf(f, "mounts() {\n");
-	if (ret < 0)
-		goto fail;
+	if (context.args->mounts_len > 0) {
+		ret = fprintf(f, "mounts() {\n");
+		if (ret < 0)
+			goto fail;
 
-	/* mount entries (bind mounts + static mounts) */
-	for (int i = 0; i < context.args.mounts_len; ++i) {
-		ret = fprintf(f, "\techo \"%s\"\n", context.args.mounts[i]);
+		/* mount entries */
+		for (int i = 0; i < context.args->mounts_len; ++i) {
+			ret = fprintf(f, "\techo \"%s\"\n", context.args->mounts[i]);
+			if (ret < 0)
+				goto fail;
+		}
+
+		ret = fprintf(f, "}\n");
 		if (ret < 0)
 			goto fail;
 	}
 
-	ret = fprintf(f, "}\n");
-	if (ret < 0)
+	if (!pyxis_execute_entrypoint()) {
+		ret = fprintf(f, "hooks() {\n");
+		if (ret < 0)
+			goto fail;
+
+		/*
+		 * /etc/rc.local will be sourced by /etc/rc.
+		 * We call 'exec' from there and do not return control to /etc/rc.
+		 */
+		ret = fprintf(f, "\techo 'exec \"$@\"' > ${ENROOT_ROOTFS}/etc/rc.local\n");
+		if (ret < 0)
+			goto fail;
+
+		ret = fprintf(f, "}\n");
+		if (ret < 0)
+			goto fail;
+	}
+
+	/* print contents */
+	if (fseek(f, 0, SEEK_SET) == 0) {
+		slurm_verbose("pyxis: enroot start configuration script:");
+		while ((line = get_line_from_file(f)) != NULL) {
+			slurm_verbose("pyxis:     %s", line);
+			free(line);
+		}
+	}
+
+	if (memccpy(*path, template, '\0', sizeof(*path)) == NULL)
 		goto fail;
 
-	rv = fd;
+	rv = 0;
 
 fail:
-	xclose(dup_fd);
 	if (f != NULL)
 		fclose(f);
-	if (rv < 0)
-		xclose(fd);
+	xclose(fd);
 
 	return (rv);
 }
 
-static int enroot_container_start(spank_t sp)
+static pid_t enroot_container_start(void)
 {
 	int ret;
-	int conf_fd = -1;
-	char *conf_file = NULL;
+	char conf_file[PATH_MAX] = { 0 };
 	pid_t pid = -1;
 	int status;
-	int rv = -1;
+	pid_t rv = -1;
 
-	conf_fd = enroot_create_start_config();
-	if (conf_fd < 0) {
-		slurm_error("pyxis: could not create enroot config");
-		goto fail;
-	}
+	slurm_info("pyxis: starting container: %s", context.container.name);
 
-	ret = asprintf(&conf_file, "/proc/self/fd/%d", conf_fd);
+	ret = enroot_create_start_config(&conf_file);
 	if (ret < 0) {
-		slurm_error("pyxis: could not allocate memory");
+		slurm_error("pyxis: couldn't create enroot start configuration script");
 		goto fail;
 	}
-
-	slurm_info("pyxis: running \"enroot start\" ...");
 
 	/*
 	 * The plugin starts the container as a subprocess and acquires handles on the
@@ -912,11 +760,10 @@ static int enroot_container_start(spank_t sp)
 	 * This requires a shell inside the container, but we could do the same with a
 	 * small static C program bind-mounted inside the container.
 	*/
-	pid = enroot_exec(context.job.uid, context.job.gid,
-			  (char *const[]){ "enroot", "start", "--root", "--rw", "--conf", conf_file, context.container.name, "sh", "-c",
-					   "kill -STOP $$ ; exit 0", NULL });
+	pid = enroot_exec_ctx((char *const[]){ "enroot", "start", "--conf", conf_file, context.container.name, "sh", "-c",
+					       "kill -STOP $$ ; exit 0", NULL });
 	if (pid < 0) {
-		slurm_error("pyxis: enroot start failed");
+		slurm_error("pyxis: failed to start container");
 		goto fail;
 	}
 
@@ -933,88 +780,218 @@ static int enroot_container_start(spank_t sp)
 	}
 
 	if (!WIFSTOPPED(status)) {
-		slurm_error("pyxis: container exited too soon, possibly due to an unusual entrypoint in the image");
+		slurm_error("pyxis: container exited too soon");
 		goto fail;
 	}
 
-	ret = container_get_fds(pid, &context.container);
-	if (ret < 0) {
-		slurm_error("pyxis: couldn't get container attributes");
-		goto fail;
-	}
+	rv = pid;
 
-	ret = spank_import_container_env(sp, pid);
-	if (ret < 0) {
-		slurm_error("pyxis: couldn't read container environment");
-		goto fail;
-	}
+fail:
+	if (rv == -1)
+		enroot_print_log_ctx();
+	if (conf_file[0] != '\0')
+		unlink(conf_file);
+
+	return (rv);
+}
+
+static int enroot_container_stop(pid_t pid)
+{
+	int ret;
+
+	if (pid <= 0)
+		return (-1);
 
 	ret = kill(pid, SIGCONT);
 	if (ret < 0) {
 		slurm_error("pyxis: couldn't send SIGCONT to container process: %s", strerror(errno));
+		return (-1);
+	}
+
+	return (0);
+}
+
+static struct shared_memory *shm_init(void)
+{
+	struct shared_memory *shm = NULL;
+	pthread_mutexattr_t mutex_attr;
+	int ret;
+
+	shm = mmap(0, sizeof(*shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (shm == MAP_FAILED) {
+		shm = NULL;
 		goto fail;
 	}
 
-	ret = child_wait(pid);
-	if (ret < 0) {
-		slurm_error("pyxis: container process terminated");
+	ret = pthread_mutexattr_init(&mutex_attr);
+	if (ret < 0)
 		goto fail;
-	}
 
-	rv = 0;
+	ret = pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+	if (ret < 0)
+		goto fail;
+
+	ret = pthread_mutexattr_setrobust(&mutex_attr, PTHREAD_MUTEX_ROBUST);
+	if (ret < 0)
+		goto fail;
+
+	ret = pthread_mutex_init(&shm->mutex, &mutex_attr);
+	if (ret < 0)
+		goto fail;
+
+	shm->init_tasks = 0;
+	shm->started_tasks = 0;
+	shm->completed_tasks = 0;
+	shm->pid = -1;
+	shm->ns_pid = -1;
+
+	return shm;
 
 fail:
-	if (rv < 0)
-		enroot_print_last_log();
-	free(conf_file);
-	xclose(conf_fd);
+	if (shm != NULL)
+		munmap(shm, sizeof(*shm));
+	return (NULL);
+}
 
-	return (rv);
+static int shm_destroy(struct shared_memory *shm)
+{
+	int ret;
+
+	if (shm == NULL)
+		return (0);
+
+	if (pthread_mutex_lock(&shm->mutex) == EOWNERDEAD)
+		pthread_mutex_consistent(&shm->mutex);
+	pthread_mutex_unlock(&shm->mutex);
+
+	ret = pthread_mutex_destroy(&shm->mutex);
+	if (ret < 0)
+		return (-1);
+
+	ret = munmap(shm, sizeof(*shm));
+	if (ret < 0)
+		return (-1);
+
+	return (0);
 }
 
 int slurm_spank_user_init(spank_t sp, int ac, char **av)
 {
 	int ret;
+	spank_err_t rc;
+	int spank_argc = 0;
+	char **spank_argv = NULL;
+	char *container_name = NULL;
+	pid_t pid;
 	int rv = -1;
 
 	if (!context.enabled)
 		return (0);
 
-	if (context.args.container_name != NULL) {
-		if (enroot_check_container_exists(context.args.container_name)) {
-			slurm_info("pyxis: reusing existing container");
-			context.container.name = strdup(context.args.container_name);
-		} else if (context.args.docker_image == NULL) {
-			slurm_error("pyxis: a container with name \"%s\" does not exist, and --container-image is not set",
-				    context.args.container_name);
+	context.shm = shm_init();
+	if (context.shm == NULL)
+		goto fail;
+
+	ret = job_get_env(sp, &context.job);
+	if (ret < 0)
+		goto fail;
+
+	if (context.job.stepid == SLURM_BATCH_SCRIPT) {
+		rc = spank_get_item(sp, S_JOB_ARGV, &spank_argc, &spank_argv);
+		if (rc != ESPANK_SUCCESS) {
+			slurm_error("pyxis: couldn't get job argv: %s", spank_strerror(rc));
+			goto fail;
+		}
+
+		if (spank_argc == 0) {
+			slurm_error("pyxis: couldn't get sbatch script: argc == 0");
+			goto fail;
+		}
+
+		/* Mount the sbatch script (from the Slurmd spool dir) inside the container */
+		ret = add_mount(spank_argv[0], spank_argv[0],
+				"x-create=file,bind,ro,nosuid,nodev,private");
+		if (ret < 0) {
+			slurm_error("pyxis: couldn't add bind mount for sbatch script");
 			goto fail;
 		}
 	}
 
-	if (context.container.name == NULL) {
-		ret = enroot_container_create(sp);
+	if (context.args->container_name != NULL) {
+		if (context.config.container_scope == SCOPE_JOB)
+			ret = xasprintf(&container_name, "pyxis_%u_%s", context.job.jobid, context.args->container_name);
+		else
+			ret = xasprintf(&container_name, "pyxis_%s", context.args->container_name);
 		if (ret < 0)
 			goto fail;
+
+		ret = enroot_container_get(container_name, &pid);
+		if (ret < 0) {
+			slurm_error("pyxis: couldn't get list of containers");
+			goto fail;
+		}
+
+		if (pid > 0) {
+			slurm_info("pyxis: reusing existing container namespaces");
+			context.shm->ns_pid = pid;
+			context.container.reuse_ns = true;
+			context.container.reuse_rootfs = true;
+		} else if (pid == 0) {
+			slurm_info("pyxis: reusing existing container filesystem");
+			context.container.reuse_rootfs = true;
+		} else if (context.args->image == NULL) {
+			slurm_error("pyxis: error: a container with name \"%s\" does not exist, and --container-image is not set",
+				    container_name);
+			goto fail;
+		}
+		context.container.name = container_name;
+		container_name = NULL;
+	} else {
+		ret = xasprintf(&context.container.name, "pyxis_%u.%u", context.job.jobid, context.job.stepid);
+		if (ret < 0)
+			goto fail;
+		context.container.temporary_rootfs = true;
 	}
 
-	slurm_debug("pyxis: using container name \"%s\"", context.container.name);
+	if (!context.container.reuse_rootfs) {
+		if (strspn(context.args->image, "./") > 0) {
+			/* Assume `image` is a path to a squashfs file. */
+			if (strnlen(context.args->image, PATH_MAX) >= PATH_MAX)
+				goto fail;
 
-	ret = enroot_container_start(sp);
-	if (ret < 0)
-		goto fail;
+			context.container.squashfs_path = strdup(context.args->image);
+		} else {
+			ret = xasprintf(&context.container.squashfs_path, "%s/%u/%u.%u.squashfs",
+					context.config.runtime_path, context.job.uid, context.job.jobid, context.job.stepid);
+			if (ret < 0 || ret >= PATH_MAX)
+				goto fail;
+			context.container.temporary_squashfs = true;
+		}
+	}
+
+	if (context.container.reuse_ns && context.args->mounts_len > 0) {
+		slurm_spank_log("pyxis: ignoring --container-mounts when attaching to a running container");
+		remove_all_mounts();
+	}
+
+	if (context.args->container_save != NULL)
+		context.container.save_path = strdup(context.args->container_save);
 
 	rv = 0;
 
 fail:
 	/*
 	 * Errors from user_init() are not propagated back to srun. Rather than fail here and have srun
-	 * report rc=0 (success), we return 0 here and throw the error in task_init_privileged()
+	 * report rc=0 (success), we return 0 here and throw the error in task_init()
 	 * instead, which will properly propagate the error back to srun.
 	 *
 	 * See https://bugs.schedmd.com/show_bug.cgi?id=7573 for more details.
 	 */
-	slurm_debug("pyxis: user_init() failed with rc=%d; postponing error for now, will report later", rv);
+	if (rv != 0)
+		slurm_debug("pyxis: user_init() failed with rc=%d; postponing error for now, will report later", rv);
 	context.user_init_rv = rv;
+	free(container_name);
+
 	return (0);
 }
 
@@ -1024,10 +1001,10 @@ static int spank_copy_env(spank_t sp, const char *from, const char *to, int over
 	spank_err_t rc;
 
 	rc = spank_getenv(sp, from, buf, sizeof(buf));
-	if (rc == ESPANK_ENV_NOEXIST)
-		return (0);
-	else if (rc != ESPANK_SUCCESS)
+	if (rc != ESPANK_SUCCESS) {
+		slurm_error("pyxis: failed to get %s: %s", from, spank_strerror(rc));
 		return (-1);
+	}
 
 	rc = spank_setenv(sp, to, buf, overwrite);
 	if (rc != ESPANK_SUCCESS) {
@@ -1038,55 +1015,13 @@ static int spank_copy_env(spank_t sp, const char *from, const char *to, int over
 	return (0);
 }
 
-static bool pmix_enabled(spank_t sp)
-{
-	spank_err_t rc;
-
-	rc = spank_getenv(sp, "PMIX_RANK", NULL, 0);
-	if (rc == ESPANK_ENV_NOEXIST || rc != ESPANK_NOSPACE)
-		return (false);
-
-	return (true);
-}
-
-static struct {
-	const char *from;
-	const char *to;
-} pmix_remap_list[] = {
-	{ "PMIX_SECURITY_MODE", "PMIX_MCA_psec" },
-	{ "PMIX_GDS_MODULE", "PMIX_MCA_gds" },
-	{ "PMIX_PTL_MODULE", "PMIX_MCA_ptl" },
-	{ NULL, NULL }
-};
-
-/*
- * Since the MCA parameters file won't be accessible from inside the container, we need to
- * set the 3 essential PMIx variables: PMIX_MCA_psec, PMIX_MCA_gds and PMIX_MCA_ptl.
- *
- * Note that we can't use the PMIx/PMI hook from enroot since the PMIx environment
- * variables are not set yet when we execute "enroot start".
- */
-static int pmix_setup(spank_t sp)
-{
-	int ret;
-
-	for (int i = 0; pmix_remap_list[i].from != NULL; ++i) {
-		ret = spank_copy_env(sp, pmix_remap_list[i].from, pmix_remap_list[i].to, 1);
-		if (ret < 0) {
-			slurm_error("pyxis: pmix: couldn't remap environment variable %s", pmix_remap_list[i].from);
-			return (-1);
-		}
-	}
-
-	return (0);
-}
-
 static bool pytorch_setup_needed(spank_t sp)
 {
+	char buf[256];
 	spank_err_t rc;
 
-	rc = spank_getenv(sp, "PYTORCH_VERSION", NULL, 0);
-	if (rc == ESPANK_ENV_NOEXIST || rc != ESPANK_NOSPACE)
+	rc = spank_getenv(sp, "PYTORCH_VERSION", buf, sizeof(buf));
+	if (rc != ESPANK_SUCCESS)
 		return (false);
 
 	return (true);
@@ -1105,8 +1040,8 @@ static struct {
  * Here, we remap a few variables so that Pytorch multi-process and multi-node works well with
  * pyxis, even though PyTorch does not use MPI.
  *
- * Some other variables are handled with an enroot hook, but these are not available yet in
- * slurm_spank_user_init(), and must be remapped later, when initializing specific tasks.
+ * Some other variables are handled with an enroot hook, but these must be
+ * initialized for each task, not once per node like the container create.
  */
 static int pytorch_setup(spank_t sp)
 {
@@ -1123,53 +1058,63 @@ static int pytorch_setup(spank_t sp)
 	return (0);
 }
 
-/*
- * We used to join the mount namespace in slurm_spank_task_init(), but had to move it to
- * slurm_spank_task_init_privileged() to overcome a limitation of the SPANK API.
- *
- * SLURM currently uses execve(2) instead of execvpe(2), hence it needs to
- * resolve the full path of the binary to execute. This resolution is done just
- * before the call to the slurm_spank_task_init callback, so it is done against
- * the host filesystem. For SLURM 18.08.7, see function exec_task() in
- * src/slurmd/slurmstepd/task.c, the path resolution function is _build_path()
- *
- * The workaround is to join the mount namespace before the call to
- * _build_path(), and in terms of SPANK API calls, that is slurm_spank_task_init_privileged().
- *
- * See https://bugs.schedmd.com/show_bug.cgi?id=7257
- */
-int slurm_spank_task_init_privileged(spank_t sp, int ac, char **av)
+static int enroot_start_once(struct container *container, struct shared_memory *shm)
 {
 	int ret;
+	int rv = -1;
 
-	if (!context.enabled)
-		return (0);
-
-	if (context.user_init_rv != 0)
-		return (context.user_init_rv);
-
-	ret = setns(context.container.mntns_fd, CLONE_NEWNS);
-	if (ret < 0) {
-		slurm_error("pyxis: couldn't join mount namespace: %s", strerror(errno));
-		return (-1);
+	if (pthread_mutex_lock(&shm->mutex) == EOWNERDEAD) {
+		pthread_mutex_consistent(&shm->mutex);
+		shm->pid = -1;
+		shm->ns_pid = -1;
+		goto fail;
 	}
 
-	/* No need to chdir(root) + chroot(".") since enroot does a pivot_root. */
-	if (context.args.workdir != NULL) {
-		ret = chdir(context.args.workdir);
-		if (ret < 0) {
-			slurm_error("pyxis: couldn't chdir to %s: %s", context.args.workdir, strerror(errno));
-			return (-1);
+	shm->init_tasks += 1;
+
+	/* The first task will create and/or start the enroot container */
+	if (shm->init_tasks == 1) {
+		if (!container->reuse_rootfs) {
+			ret = enroot_container_create();
+			if (ret < 0)
+				goto fail;
 		}
-	} else {
-		ret = fchdir(context.container.cwd_fd);
-		if (ret < 0) {
-			slurm_error("pyxis: couldn't chdir to container cwd: %s", strerror(errno));
-			return (-1);
-		}
+		shm->pid = enroot_container_start();
+
+		if (!container->reuse_ns)
+			shm->ns_pid = shm->pid;
 	}
 
-	return (0);
+	if (shm->pid < 0 || shm->ns_pid < 0)
+		goto fail;
+
+	rv = 0;
+
+fail:
+	pthread_mutex_unlock(&shm->mutex);
+
+	return (rv);
+}
+
+static int enroot_stop_once(struct container *container, struct shared_memory *shm)
+{
+	int ret;
+	int rv = -1;
+
+	/* Last task to start can stop the container process. */
+	if (atomic_fetch_add(&shm->started_tasks, 1) == context.job.local_task_count - 1) {
+		ret = enroot_container_stop(shm->pid);
+		if (ret < 0)
+			goto fail;
+
+		shm->pid = -1;
+		shm->ns_pid = -1;
+	}
+
+	rv = 0;
+
+fail:
+	return (rv);
 }
 
 int slurm_spank_task_init(spank_t sp, int ac, char **av)
@@ -1180,10 +1125,38 @@ int slurm_spank_task_init(spank_t sp, int ac, char **av)
 	if (!context.enabled)
 		return (0);
 
-	if (pmix_enabled(sp)) {
-		ret = pmix_setup(sp);
-		if (ret < 0)
-			goto fail;
+	if (context.user_init_rv != 0)
+		return (context.user_init_rv);
+
+	/* reload the job's environment in this context, to get PMIx variables */
+	ret = job_get_env(sp, &context.job);
+	if (ret < 0)
+		goto fail;
+
+	ret = enroot_start_once(&context.container, context.shm);
+	if (ret < 0) {
+		slurm_error("pyxis: couldn't start container");
+		if (pyxis_execute_entrypoint())
+			slurm_error("pyxis: if the image has an unusual entrypoint, try using --no-container-entrypoint");
+		goto fail;
+	}
+
+	ret = container_get_namespaces(context.shm->ns_pid, &context.container);
+	if (ret < 0) {
+		slurm_error("pyxis: couldn't get container namespaces");
+		goto fail;
+	}
+
+	ret = container_get_cwd(context.shm->pid, &context.container);
+	if (ret < 0) {
+		slurm_error("pyxis: couldn't get container directory");
+		goto fail;
+	}
+
+	ret = spank_import_container_env(sp, context.shm->pid);
+	if (ret < 0) {
+		slurm_error("pyxis: couldn't read container environment");
+		goto fail;
 	}
 
 	if (pytorch_setup_needed(sp)) {
@@ -1198,22 +1171,112 @@ int slurm_spank_task_init(spank_t sp, int ac, char **av)
 		goto fail;
 	}
 
-	/* The user will see themself as (remapped) uid/gid 0 inside the container */
-	ret = setgid(0);
+	if (context.container.cgroupns_fd >= 0) {
+		ret = setns(context.container.cgroupns_fd, CLONE_NEWCGROUP);
+		if (ret < 0) {
+			slurm_error("pyxis: couldn't join cgroup namespace: %s", strerror(errno));
+			goto fail;
+		}
+	}
+
+	ret = setns(context.container.mntns_fd, CLONE_NEWNS);
 	if (ret < 0) {
-		slurm_error("pyxis: setgid failed");
+		slurm_error("pyxis: couldn't join mount namespace: %s", strerror(errno));
 		goto fail;
 	}
 
-	ret = setuid(0);
-	if (ret < 0) {
-		slurm_error("pyxis: setuid failed");
-		goto fail;
+	/* No need to chdir(root) + chroot(".") since enroot does a pivot_root. */
+	if (context.args->workdir != NULL) {
+		ret = chdir(context.args->workdir);
+		if (ret < 0) {
+			slurm_error("pyxis: couldn't chdir to %s: %s", context.args->workdir, strerror(errno));
+			goto fail;
+		}
+	} else {
+		ret = fchdir(context.container.cwd_fd);
+		if (ret < 0) {
+			slurm_error("pyxis: couldn't chdir to container cwd: %s", strerror(errno));
+			goto fail;
+		}
 	}
 
 	ret = seccomp_set_filter();
 	if (ret < 0) {
-		slurm_error("pyxis: seccomp filter failed");
+		slurm_error("pyxis: seccomp filter failed: %s", strerror(errno));
+		goto fail;
+	}
+
+	ret = enroot_stop_once(&context.container, context.shm);
+	if (ret < 0)
+		goto fail;
+
+	rv = 0;
+
+fail:
+	return (rv);
+}
+
+static int enroot_container_export(void)
+{
+	int ret;
+	char path[PATH_MAX];
+
+	if (context.container.save_path[0] == '/') {
+		if (memccpy(path, context.container.save_path, '\0', sizeof(path)) == NULL)
+			return (-1);
+	} else {
+		if (context.job.cwd[0] == '\0') {
+			slurm_error("pyxis: container export: relative path used, but job's cwd is unset");
+			return (-1);
+		}
+
+		ret = snprintf(path, sizeof(path), "%s/%s", context.job.cwd, context.container.save_path);
+		if (ret < 0 || ret >= sizeof(path))
+			return (-1);
+	}
+
+	ret = enroot_exec_wait_ctx((char *const[]){ "enroot", "export", "-f", "-o", path, context.container.name, NULL });
+	if (ret < 0) {
+		enroot_print_log_ctx();
+		return (-1);
+	}
+
+	return (0);
+}
+
+static int enroot_export_once(struct container *container, struct shared_memory *shm)
+{
+	int ret;
+
+	if (atomic_fetch_add(&context.shm->completed_tasks, 1) == context.job.local_task_count - 1) {
+		/* Check if job was interrupted before it fully started. */
+		if (context.shm->started_tasks != context.job.local_task_count)
+			return (0);
+
+		ret = enroot_container_export();
+		if (ret < 0)
+			return (-1);
+
+		slurm_spank_log("pyxis: exported container %s to %s", context.container.name, context.container.save_path);
+	}
+
+	return (0);
+}
+
+int slurm_spank_task_exit(spank_t sp, int ac, char **av)
+{
+	int ret;
+	int rv = -1;
+
+	if (!context.enabled)
+		return (0);
+
+	if (context.container.save_path == NULL)
+		return (0);
+
+	ret = enroot_export_once(&context.container, context.shm);
+	if (ret < 0) {
+		slurm_error("pyxis: failed to export container %s to %s", context.container.name, context.container.save_path);
 		goto fail;
 	}
 
@@ -1223,35 +1286,51 @@ fail:
 	return (rv);
 }
 
-int slurm_spank_exit(spank_t sp, int ac, char **av)
+int pyxis_slurmstepd_exit(spank_t sp, int ac, char **av)
 {
 	int ret;
+	int rv = 0;
 
-	if (context.container.name != NULL && context.args.container_name == NULL) {
-		slurm_info("pyxis: running \"enroot remove\" ...");
+	/* Need to cleanup the temporary squashfs if the task running "enroot import" was interrupted. */
+	if (context.container.temporary_squashfs && context.container.squashfs_path != NULL)
+	        unlink(context.container.squashfs_path);
 
-		ret = enroot_exec_wait(context.job.uid, context.job.gid,
-				       (char *const[]){ "enroot", "remove", "-f", context.container.name, NULL });
+	if (context.container.temporary_rootfs) {
+		slurm_info("pyxis: removing container filesystem: %s", context.container.name);
+
+		ret = enroot_exec_wait_ctx((char *const[]){ "enroot", "remove", "-f", context.container.name, NULL });
 		if (ret < 0) {
-			slurm_info("pyxis: enroot remove %s failed", context.container.name);
-			enroot_print_last_log();
+			slurm_error("pyxis: failed to remove container filesystem: %s", context.container.name);
+			enroot_print_log_ctx();
+			rv = -1;
 		}
 	}
-	free(context.container.name);
 
-	free(context.args.docker_image);
-	for (int i = 0; i < context.args.mounts_len; ++i)
-		free(context.args.mounts[i]);
-	free(context.args.mounts);
-	free(context.args.workdir);
-	free(context.args.container_name);
+	free(context.container.name);
+	free(context.container.squashfs_path);
+	free(context.container.save_path);
+
+	if (context.job.environ != NULL) {
+		for (int i = 0; context.job.environ[i] != NULL; ++i)
+			free(context.job.environ[i]);
+		free(context.job.environ);
+	}
 
 	xclose(context.container.userns_fd);
 	xclose(context.container.mntns_fd);
+	xclose(context.container.cgroupns_fd);
 	xclose(context.container.cwd_fd);
 	xclose(context.log_fd);
 
+	ret = shm_destroy(context.shm);
+	if (ret < 0) {
+		slurm_error("pyxis: couldn't destroy shared memory: %s", strerror(errno));
+		rv = -1;
+	}
+
+	pyxis_args_free();
+
 	memset(&context, 0, sizeof(context));
 
-	return (0);
+	return (rv);
 }

@@ -16,31 +16,47 @@ A pyxis is an [ancient small box or container](https://en.wikipedia.org/wiki/Pyx
 * Does not require cluster-wide management of subordinate user/group ids.
 
 ## Installation
-Pyxis requires the [enroot](https://github.com/nvidia/enroot) container utility to be installed.
+Pyxis requires the [enroot](https://github.com/nvidia/enroot) container utility (version `3.1.0`) to be installed.
 
+#### With `make install`
 ```console
-$ # Option 1: quick install from sources
 $ sudo make install
 $ sudo ln -s /usr/local/share/pyxis/pyxis.conf /etc/slurm-llnl/plugstack.conf.d/pyxis.conf
+$ sudo systemctl restart slurmd
+```
 
-$ # Option 2: generate a deb package and install it
+#### With a deb package
+```console
 $ make orig
 $ make deb
 $ sudo dpkg -i ../nvslurm-plugin-pyxis_*_amd64.deb
 $ sudo ln -s /usr/share/pyxis/pyxis.conf /etc/slurm-llnl/plugstack.conf.d/pyxis.conf
+$ sudo systemctl restart slurmd
+```
+
+#### With a rpm package
+```console
+$ make rpm
+$ sudo rpm -i x86_64/nvslurm-plugin-pyxis-*-1.el7.x86_64.rpm
+$ sudo ln -s /usr/share/pyxis/pyxis.conf /etc/slurm/plugstack.conf.d/pyxis.conf
+$ sudo systemctl restart slurmd
 ```
 
 ## Usage
 Pyxis being a SPANK plugin, the new command-line arguments it introduces are directly added to `srun`.
 
-```
+```console
 $ srun --help
 ...
-      --container-image=[USER@][REGISTRY#]IMAGE[:TAG]
-                              [pyxis] docker image to use, as an enroot URI
+      --container-image=[USER@][REGISTRY#]IMAGE[:TAG]|PATH
+                              [pyxis] the image to use for the container
+                              filesystem. Can be either a docker image given as
+                              an enroot URI, or a path to a squashfs file on the
+                              remote host filesystem.
 
-      --container-mounts=SRC:DST[,SRC:DST...]
-                              [pyxis] bind mount[s] inside the container
+      --container-mounts=SRC:DST[:FLAGS][,SRC:DST...]
+                              [pyxis] bind mount[s] inside the container. Mount
+                              flags are separated with "+", e.g. "ro+rprivate"
 
       --container-workdir=PATH
                               [pyxis] working directory inside the container
@@ -50,31 +66,69 @@ $ srun --help
                               containers are not. If a container with this name
                               already exists, the existing container is used and
                               the import is skipped.
+      --container-save=PATH   [pyxis] Save the container state to a squashfs
+                              file on the remote host filesystem.
+      --container-mount-home  [pyxis] bind mount the user's home directory.
+                              System-level enroot settings might cause this
+                              directory to be already-mounted.
+
+      --no-container-mount-home
+                              [pyxis] do not bind mount the user's home
+                              directory
+      --container-remap-root  [pyxis] ask to be remapped to root inside the
+                              container. Does not grant elevated system
+                              permissions, despite appearances.
+
+      --no-container-remap-root
+                              [pyxis] do not remap to root inside the container
+      --container-entrypoint  [pyxis] execute the entrypoint from the container
+                              image
+
+      --no-container-entrypoint
+                              [pyxis] do not execute the entrypoint from the
+                              container image
+      --container-writable    [pyxis] make the container filesystem writable
+      --container-readonly    [pyxis] make the container filesystem read-only
 ```
 
 ## Examples
 
+### `srun`
 ```console
 $ # Run a command on a worker node
-$ srun grep NAME /etc/os-release
-NAME="Ubuntu"
-PRETTY_NAME="Ubuntu 18.04.2 LTS"
-VERSION_CODENAME=bionic
-UBUNTU_CODENAME=bionic
+$ srun grep PRETTY /etc/os-release
+PRETTY_NAME="Ubuntu 20.04.2 LTS"
 
 $ # run the same command, but now inside of a container
-$ srun --container-image=centos grep NAME /etc/os-release
-NAME="CentOS Linux"
-PRETTY_NAME="CentOS Linux 7 (Core)"
-CPE_NAME="cpe:/o:centos:centos:7"
+$ srun --container-image=centos grep PRETTY /etc/os-release
+PRETTY_NAME="CentOS Linux 8"
 
-$ # run inside the container, but mount the file from the host
-$ srun --container-image=centos --container-mounts=/etc/os-release:/etc/os-release grep NAME /etc/os-release
-NAME="Ubuntu"
-PRETTY_NAME="Ubuntu 18.04.2 LTS"
-VERSION_CODENAME=bionic
-UBUNTU_CODENAME=bionic
+$ # mount a file from the host and run the command on it, from inside the container
+$ srun --container-image=centos --container-mounts=/etc/os-release:/host/os-release grep PRETTY /host/os-release
+PRETTY_NAME="Ubuntu 20.04.2 LTS"
 ```
+
+### `sbatch`
+```console
+$ # execute the sbatch script inside a container image
+$ sbatch --wait -o slurm.out <<EOF
+#!/bin/bash
+#SBATCH --container-image nvcr.io\#nvidia/pytorch:21.12-py3
+
+python -c 'import torch ; print(torch.__version__)'
+EOF
+
+$ cat slurm.out
+pyxis: importing docker image: nvcr.io#nvidia/pytorch:21.12-py3
+1.11.0a0+b6df043
+```
+As `#` is the character used to start a `SBATCH` comment, this character needs to be escaped when also used in `--container-image` as a separator between the registry and the image name.
+
+## Advanced Documentation (wiki)
+1. [Home](https://github.com/NVIDIA/pyxis/wiki/Home)
+1. [Installation](https://github.com/NVIDIA/pyxis/wiki/Installation)
+1. [Setup](https://github.com/NVIDIA/pyxis/wiki/Setup)
+1. [Usage](https://github.com/NVIDIA/pyxis/wiki/Usage)
 
 ## Copyright and License
 
@@ -84,6 +138,14 @@ This project is released under the [Apache License Version 2.0](https://github.c
 
 * Please let us know by [filing a new issue](https://github.com/NVIDIA/pyxis/issues/new)
 * Check [CONTRIBUTING](CONTRIBUTING.md) and then open a [pull request](https://help.github.com/articles/using-pull-requests/)
+
+## Running tests
+Integration tests can be ran with [bats](https://github.com/bats-core/bats-core) from within a Slurm job allocation:
+```console
+$ salloc --overcommit bats tests
+$ bats tests/sbatch
+```
+Some tests assume a specific enroot configuration (such as PMIx/PyTorch hooks), so they might not pass on all systems.
 
 ## Reporting Security Issues
 

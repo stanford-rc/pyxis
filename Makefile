@@ -6,16 +6,19 @@ datadir     ?= $(datarootdir)
 PLUGINDIR := $(abspath $(DESTDIR)/$(libdir)/slurm)
 CONFDIR   := $(abspath $(DESTDIR)/$(datadir)/pyxis)
 
+ARCH      ?= $(shell uname -m)
+VERSION   ?= 0.13.0
+
 PLUGIN := spank_pyxis.so
 CONF   := pyxis.conf
 
-.PHONY: all install uninstall clean deb
+.PHONY: all install uninstall clean deb rpm
 
-CPPFLAGS := -D_GNU_SOURCE -D_FORTIFY_SOURCE=2 -I/usr/include/slurm -I/usr/include/slurm-wlm $(CPPFLAGS)
+CPPFLAGS := -D_GNU_SOURCE -D_FORTIFY_SOURCE=2 -DPYXIS_VERSION=\"$(VERSION)\" $(CPPFLAGS)
 CFLAGS := -std=gnu11 -O2 -g -Wall -Wunused-variable -fstack-protector-strong -fpic $(CFLAGS)
 LDFLAGS := -Wl,-znoexecstack -Wl,-zrelro -Wl,-znow $(LDFLAGS)
 
-C_SRCS := pyxis_slurmstepd.c pyxis_slurmd.c
+C_SRCS := common.c args.c pyxis_slurmstepd.c pyxis_slurmd.c pyxis_srun.c pyxis_alloc.c pyxis_dispatch.c config.c enroot.c
 C_OBJS := $(C_SRCS:.c=.o)
 
 DEPS := $(C_OBJS:%.o=%.d)
@@ -26,7 +29,7 @@ $(C_OBJS): %.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -MMD -MF $*.d -c $<
 
 $(PLUGIN): $(C_OBJS)
-	$(CC) -shared $(LDFLAGS) -o $@ $^
+	$(CC) -shared $(LDFLAGS) -o $@ spank_pyxis.lds $^
 	strip --strip-unneeded -R .comment $@
 
 install: all
@@ -43,9 +46,14 @@ clean:
 	rm -rf $(C_OBJS) $(DEPS) $(PLUGIN)
 
 orig: clean
-	tar -caf ../nvslurm-plugin-pyxis_0.1.0.orig.tar.xz --owner=root --group=root --exclude=.git .
+	tar -caf ../nvslurm-plugin-pyxis_$(VERSION).orig.tar.xz --owner=root --group=root --exclude=.git .
 
 deb: clean
 	debuild -us -uc -G -i -tc
+
+rpm: clean
+	test -e $(ARCH) || ln -s . $(ARCH)
+	rpmbuild --target=$(ARCH) --clean -ba -D"_topdir $(CURDIR)/rpm" -D"VERSION $(VERSION)" pyxis.spec
+	$(RM) -r $(ARCH) $(addprefix rpm/, BUILDROOT SOURCES)
 
 -include $(DEPS)
