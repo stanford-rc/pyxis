@@ -26,6 +26,12 @@ load ./common
     run_srun --container-image=ubuntu:22.04 grep 'Ubuntu 22.04' /etc/os-release
 }
 
+@test "Docker Hub ubuntu:24.04" {
+    run_srun --container-image=ubuntu:24.04 grep 'Ubuntu 24.04' /etc/os-release
+    # Test for https://github.com/NVIDIA/enroot/commit/f0552fb7ce3798d02e8838db2f9402aa2094b348
+    run_srun --container-image=ubuntu:24.04 --container-remap-root bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata'
+}
+
 @test "Docker Hub centos:5" {
     run_srun --container-image=centos:5 grep 'CentOS release 5.11 (Final)' /etc/redhat-release
 }
@@ -52,14 +58,9 @@ load ./common
     [ "${lines[-1]}" == "1.12.0a0+bd13bc6" ]
 }
 
-@test "gcr.io TensorFlow 1.14" {
-    run_srun --no-container-mount-home --container-image=gcr.io#deeplearning-platform-release/tf-gpu.1-14 /entrypoint.sh python -c 'import tensorflow; print(tensorflow.__version__)'
-    [ "${lines[-1]}" == "1.14.0" ]
-}
-
-@test "gcr.io TensorFlow 2.8" {
-    run_srun --no-container-mount-home --container-image=gcr.io#deeplearning-platform-release/tf-gpu.2-8 /entrypoint.sh python -c 'import tensorflow; print(tensorflow.__version__)'
-    [ "${lines[-1]}" == "2.8.0" ]
+@test "gcr.io TensorFlow 2.9" {
+    run_srun --no-container-mount-home --container-image=gcr.io#deeplearning-platform-release/tf-cpu.2-9 /entrypoint.sh python -c 'import tensorflow; print(tensorflow.__version__)'
+    [[ "${lines[-1]}" == 2.9.* ]]
 }
 
 @test "gitlab.com NVIDIA device plugin" {
@@ -77,4 +78,15 @@ load ./common
     [ "${status}" -ne 0 ]
     attempts=$(grep -c 'failed to import docker image' <<< "${output}")
     [ "${attempts}" -eq 1 ]
+}
+
+@test "docker:// explicit import" {
+    run_srun --container-image docker://nvidia/cuda:11.8.0-base-ubuntu20.04 grep 'Ubuntu 20.04' /etc/os-release
+}
+
+@test "dockerd:// import" {
+    if ! which docker; then
+	skip "docker not installed"
+    fi
+    run_srun --container-image dockerd://nvidia/cuda:11.8.0-base-ubuntu22.04 grep 'Ubuntu 22.04' /etc/os-release
 }

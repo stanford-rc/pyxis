@@ -18,10 +18,12 @@ A pyxis is an [ancient small box or container](https://en.wikipedia.org/wiki/Pyx
 ## Installation
 Pyxis requires the [enroot](https://github.com/nvidia/enroot) container utility (version `3.1.0`) to be installed.
 
+Since [Slurm 21.08](https://github.com/SchedMD/slurm/blob/slurm-21-08-8-2/RELEASE_NOTES#L119-L121), pyxis must be compiled against the release of Slurm that is going to be deployed on the cluster. Compiling against `spank.h` from a different Slurm release will cause Slurm to prevent pyxis from loading with error `Incompatible plugin version`.
+
 #### With `make install`
 ```console
 $ sudo make install
-$ sudo ln -s /usr/local/share/pyxis/pyxis.conf /etc/slurm-llnl/plugstack.conf.d/pyxis.conf
+$ sudo ln -s /usr/local/share/pyxis/pyxis.conf /etc/slurm/plugstack.conf.d/pyxis.conf
 $ sudo systemctl restart slurmd
 ```
 
@@ -30,7 +32,7 @@ $ sudo systemctl restart slurmd
 $ make orig
 $ make deb
 $ sudo dpkg -i ../nvslurm-plugin-pyxis_*_amd64.deb
-$ sudo ln -s /usr/share/pyxis/pyxis.conf /etc/slurm-llnl/plugstack.conf.d/pyxis.conf
+$ sudo ln -s /usr/share/pyxis/pyxis.conf /etc/slurm/plugstack.conf.d/pyxis.conf
 $ sudo systemctl restart slurmd
 ```
 
@@ -87,8 +89,20 @@ $ srun --help
       --no-container-entrypoint
                               [pyxis] do not execute the entrypoint from the
                               container image
+
+      --container-entrypoint-log
+                              [pyxis] print the output of the entrypoint script
       --container-writable    [pyxis] make the container filesystem writable
       --container-readonly    [pyxis] make the container filesystem read-only
+
+      --container-env=NAME[,NAME...]
+                              [pyxis] names of environment variables to override
+                              with the host environment and set at the entrypoint.
+                              By default, all exported host environment variables
+                              are set in the container after the entrypoint is run,
+                              but their existing values in the image take precedence;
+                              the variables specified with this flag are preserved
+                              from the host and set before the entrypoint runs
 ```
 
 ## Examples

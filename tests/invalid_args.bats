@@ -33,6 +33,11 @@ load ./common
     [ "${status}" -ne 0 ]
 }
 
+@test "invalid arg: --container-name=:exec" {
+    run_srun_unchecked --container-name=:attach --container-image=ubuntu:22.04 true
+    [ "${status}" -ne 0 ]
+}
+
 @test "invalid arg: --container-mounts= (without argument)" {
     run_srun_unchecked --container-mounts=  --container-image=ubuntu:18.04 findmnt /foo
     [ "${status}" -ne 0 ]
@@ -55,5 +60,26 @@ load ./common
 
 @test "invalid arg: --container-readonly --container-writable" {
     run_srun_unchecked --container-readonly --container-writable --container-image=ubuntu:20.04 true
+    [ "${status}" -ne 0 ]
+}
+
+@test "invalid arg: --container-env= (without argument)" {
+    run_srun_unchecked --container-env= --container-image=ubuntu:22.04 true
+    [ "${status}" -ne 0 ]
+}
+
+@test "invalid arg: --container-env trailing comma" {
+    run_srun_unchecked --container-env FOO, --container-image=ubuntu:22.04 true
+    [ "${status}" -ne 0 ]
+}
+
+@test "invalid arg: --container-save=<directory>" {
+    run_srun_unchecked --container-save=/tmp/ --container-image=ubuntu:24.04 true
+    [ "${status}" -ne 0 ]
+
+    run_srun_unchecked --container-save=/ --container-image=ubuntu:24.04 true
+    [ "${status}" -ne 0 ]
+
+    run_srun_unchecked --container-save=./ --container-image=ubuntu:24.04 true
     [ "${status}" -ne 0 ]
 }

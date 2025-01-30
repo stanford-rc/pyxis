@@ -1,3 +1,51 @@
+nvslurm-plugin-pyxis (0.20.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.20.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Wed, 31 Jul 2024 00:22:05 +0000
+
+nvslurm-plugin-pyxis (0.19.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.19.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Fri, 12 Apr 2024 22:05:30 +0000
+
+nvslurm-plugin-pyxis (0.18.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.18.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Tue, 19 Mar 2024 00:38:00 +0000
+
+nvslurm-plugin-pyxis (0.17.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.17.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Thu, 25 Jan 2024 21:31:42 +0000
+
+nvslurm-plugin-pyxis (0.16.1-1) UNRELEASED; urgency=medium
+
+  * Release v0.16.1
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Fri, 08 Sep 2023 01:26:12 +0000
+
+nvslurm-plugin-pyxis (0.16.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.16.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Mon, 21 Aug 2023 16:36:26 +0000
+
+nvslurm-plugin-pyxis (0.15.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.15.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Mon, 06 Mar 2023 22:04:25 +0000
+
+nvslurm-plugin-pyxis (0.14.0-1) UNRELEASED; urgency=medium
+
+  * Release v0.14.0
+
+ -- NVIDIA CORPORATION <cudatools@nvidia.com>  Fri, 23 Sep 2022 18:29:01 +0000
+
 nvslurm-plugin-pyxis (0.13.0-1) UNRELEASED; urgency=medium
 
   * Release v0.13.0

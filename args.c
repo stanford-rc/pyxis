@@ -15,11 +15,15 @@ static struct plugin_args pyxis_args = {
 	.mounts_len = 0,
 	.workdir = NULL,
 	.container_name = NULL,
+	.container_name_flags = NULL,
 	.container_save = NULL,
 	.mount_home = -1,
 	.remap_root = -1,
 	.entrypoint = -1,
+	.entrypoint_log = -1,
 	.writable   = -1,
+	.env_vars = NULL,
+	.env_vars_len = 0,
 };
 
 static int spank_option_image(int val, const char *optarg, int remote);
@@ -30,7 +34,9 @@ static int spank_option_container_save(int val, const char *optarg, int remote);
 static int spank_option_container_mount_home(int val, const char *optarg, int remote);
 static int spank_option_container_remap_root(int val, const char *optarg, int remote);
 static int spank_option_container_entrypoint(int val, const char *optarg, int remote);
+static int spank_option_container_entrypoint_log(int val, const char *optarg, int remote);
 static int spank_option_container_writable(int val, const char *optarg, int remote);
+static int spank_option_container_env(int val, const char *optarg, int remote);
 
 struct spank_option spank_opts[] =
 {
@@ -111,6 +117,13 @@ struct spank_option spank_opts[] =
 		0, 0, spank_option_container_entrypoint
 	},
 	{
+		"container-entrypoint-log",
+		NULL,
+		"[pyxis] print the output of the entrypoint script"
+		,
+		0, 1, spank_option_container_entrypoint_log
+	},
+	{
 		"container-writable",
 		NULL,
 		"[pyxis] make the container filesystem writable"
@@ -123,6 +136,15 @@ struct spank_option spank_opts[] =
 		"[pyxis] make the container filesystem read-only"
 		,
 		0, 0, spank_option_container_writable
+	},
+	{
+		"container-env",
+		"NAME[,NAME...]",
+		"[pyxis] names of environment variables to override with the host environment and set at the entrypoint. "
+		"By default, all exported host environment variables are set in the container after the entrypoint is run, "
+		"but their existing values in the image take precedence; "
+		"the variables specified with this flag are preserved from the host and set before the entrypoint runs",
+		1, 0, spank_option_container_env
 	},
 	SPANK_OPTIONS_TABLE_END
 };
@@ -145,42 +167,6 @@ static int spank_option_image(int val, const char *optarg, int remote)
 
 	pyxis_args.image = strdup(optarg);
 	return (0);
-}
-
-static int add_mount_entry(const char *entry)
-{
-	char *entry_dup = NULL;
-	char **p = NULL;
-	int rv = -1;
-
-	for (size_t i = 0; i < pyxis_args.mounts_len; ++i) {
-		/* This mount entry already exists, skip it. */
-		if (strcmp(pyxis_args.mounts[i], entry) == 0) {
-			slurm_info("pyxis: skipping duplicate mount entry: %s", entry);
-			return (0);
-		}
-	}
-
-	entry_dup = strdup(entry);
-	if (entry_dup == NULL)
-		goto fail;
-
-	p = realloc(pyxis_args.mounts, sizeof(*pyxis_args.mounts) * (pyxis_args.mounts_len + 1));
-	if (p == NULL)
-		goto fail;
-	pyxis_args.mounts = p;
-	p = NULL;
-
-	pyxis_args.mounts[pyxis_args.mounts_len] = entry_dup;
-	entry_dup = NULL;
-	pyxis_args.mounts_len += 1;
-
-	rv = 0;
-
-fail:
-	free(entry_dup);
-	free(p);
-	return (rv);
 }
 
 int add_mount(const char *source, const char *target, const char *flags)
@@ -217,7 +203,7 @@ int add_mount(const char *source, const char *target, const char *flags)
 		goto fail;
 	}
 
-	ret = add_mount_entry(entry);
+	ret = array_add_unique(&pyxis_args.mounts, &pyxis_args.mounts_len, entry);
 	if (ret < 0)
 		goto fail;
 
@@ -231,12 +217,7 @@ fail:
 
 void remove_all_mounts(void)
 {
-	for (int i = 0; i < pyxis_args.mounts_len; ++i)
-		free(pyxis_args.mounts[i]);
-	free(pyxis_args.mounts);
-
-	pyxis_args.mounts = NULL;
-	pyxis_args.mounts_len = 0;
+	array_free(&pyxis_args.mounts, &pyxis_args.mounts_len);
 }
 
 static int parse_mount_option(const char *option)
@@ -347,6 +328,10 @@ static int spank_option_workdir(int val, const char *optarg, int remote)
 
 static int spank_option_container_name(int val, const char *optarg, int remote)
 {
+	char *optarg_dup = NULL;
+	char *name, *flags;
+	int rv = -1;
+
 	if (optarg == NULL || *optarg == '\0') {
 		slurm_error("pyxis: --container-name: argument required");
 		return (-1);
@@ -361,14 +346,45 @@ static int spank_option_container_name(int val, const char *optarg, int remote)
 		return (-1);
 	}
 
-	pyxis_args.container_name = strdup(optarg);
-	return (0);
+	optarg_dup = strdup(optarg);
+
+	flags = optarg_dup;
+	name = strsep(&flags, ":");
+
+	if (name == NULL || name[0] == '\0') {
+		slurm_error("pyxis: --container-name: empty name");
+		goto fail;
+	}
+
+	if (flags == NULL || flags[0] == '\0')
+		flags = "auto";
+
+	if (strcmp(flags, "auto") != 0 && strcmp(flags, "create") != 0 &&
+	    strcmp(flags, "exec") != 0 && strcmp(flags, "no_exec") != 0) {
+		slurm_error("pyxis: --container-name: flag must be \"auto\", \"create\", \"exec\" or \"no_exec\"");
+		goto fail;
+	}
+
+	pyxis_args.container_name = strdup(name);
+	pyxis_args.container_name_flags = strdup(flags);
+
+	rv = 0;
+
+fail:
+	free(optarg_dup);
+
+	return (rv);
 }
 
 static int spank_option_container_save(int val, const char *optarg, int remote)
 {
 	if (optarg == NULL || *optarg == '\0') {
 		slurm_error("pyxis: --container-save: argument required");
+		return (-1);
+	}
+
+	if (optarg[strlen(optarg) - 1] == '/') {
+		slurm_error("pyxis: --container-save: target is a directory");
 		return (-1);
 	}
 
@@ -421,6 +437,13 @@ static int spank_option_container_entrypoint(int val, const char *optarg, int re
 	return (0);
 }
 
+static int spank_option_container_entrypoint_log(int val, const char *optarg, int remote)
+{
+	pyxis_args.entrypoint_log = val;
+
+	return (0);
+}
+
 static int spank_option_container_writable(int val, const char *optarg, int remote)
 {
 	if (pyxis_args.writable != -1 && pyxis_args.writable != val) {
@@ -431,6 +454,44 @@ static int spank_option_container_writable(int val, const char *optarg, int remo
 	pyxis_args.writable = val;
 
 	return (0);
+}
+
+static int spank_option_container_env(int val, const char *optarg, int remote)
+{
+	int ret;
+	char *optarg_dup = NULL;
+	char *args, *arg;
+	int rv = -1;
+
+	if (optarg == NULL || *optarg == '\0') {
+		slurm_error("pyxis: --container-env: argument required");
+		goto fail;
+	}
+
+	optarg_dup = strdup(optarg);
+	if (optarg_dup == NULL) {
+		slurm_error("pyxis: could not allocate memory");
+		goto fail;
+	}
+
+	args = optarg_dup;
+	while ((arg = strsep(&args, ",")) != NULL) {
+		if (*arg == '\0') {
+			slurm_error("pyxis: --container-env: invalid format: %s", optarg);
+			goto fail;
+		}
+
+		ret = array_add_unique(&pyxis_args.env_vars, &pyxis_args.env_vars_len, arg);
+		if (ret < 0)
+			goto fail;
+	}
+
+	rv = 0;
+
+fail:
+	free(optarg_dup);
+
+	return (rv);
 }
 
 struct plugin_args *pyxis_args_register(spank_t sp)
@@ -473,6 +534,8 @@ void pyxis_args_free(void)
 	remove_all_mounts();
 	free(pyxis_args.workdir);
 	free(pyxis_args.container_name);
+	free(pyxis_args.container_name_flags);
 	free(pyxis_args.container_save);
+	array_free(&pyxis_args.env_vars, &pyxis_args.env_vars_len);
 }
 

@@ -9,7 +9,12 @@ URL:            https://github.com/NVIDIA/pyxis/
 BuildRequires:  make gcc slurm-devel
 
 Summary:        Pyxis is a SPANK plugin for the SLURM workload manager
+
+%if 0%{?fedora} >= 23 || 0%{?rhel} >= 8 || 0%{?suse_version} >= 1500
 Requires:       (enroot >= 3.1.0 or enroot-hardened >= 3.1.0)
+%else
+Requires:       enroot >= 3.1.0
+%endif
 
 %description
 Pyxis is a SPANK plugin for the SLURM Workload Manager. It allows unprivileged
@@ -31,6 +36,30 @@ cluster users to run containerized tasks through the srun command.
 
 
 %changelog
+* Wed Jul 31 2024 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.20.0-1
+- Release v0.20.0
+
+* Fri Apr 12 2024 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.19.0-1
+- Release v0.19.0
+
+* Tue Mar 19 2024 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.18.0-1
+- Release v0.18.0
+
+* Thu Jan 25 2024 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.17.0-1
+- Release v0.17.0
+
+* Fri Sep 08 2023 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.16.1-1
+- Release v0.16.1
+
+* Mon Aug 21 2023 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.16.0-1
+- Release v0.16.0
+
+* Mon Mar 06 2023 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.15.0-1
+- Release v0.15.0
+
+* Fri Sep 23 2022 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.14.0-1
+- Release v0.14.0
+
 * Thu May 05 2022 NVIDIA CORPORATION <cudatools@nvidia.com> - 0.13.0-1
 - Release v0.13.0
 
