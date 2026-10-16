@@ -11,4 +11,7 @@ SLURM_SERIES := $(shell echo '$(SLURM_VERSION)' | sed 's/.*://' | \
 SLURM_EPOCH := $(shell echo '$(SLURM_VERSION)' | sed -n 's/:.*$$/:/p')
 SLURM_NEXT := $(SLURM_EPOCH)$(shell echo '$(SLURM_SERIES)' | \
     awk -F. '{printf "%s.%02d", $$1, $$2 + 1}')
-SLURM_PACKAGE := $(if $(filter slurm-smd-dev,$(SLURM_DEV)),slurm-smd,slurm-wlm)
+SLURM_PACKAGE := slurm-wlm-basic-plugins
+ifeq ($(SLURM_DEV),slurm-smd-dev)
+SLURM_PACKAGE := slurm-smd
+endif

@@ -58,6 +58,7 @@ deb: clean
 	changelog=$$(mktemp); \
 	cp debian/changelog "$$changelog"; \
 	trap 'cp "$$changelog" debian/changelog; rm -f "$$changelog"' EXIT; \
+	trap 'exit 1' HUP INT TERM; \
 	dch --maintmaint --newversion "$$version" --distribution UNRELEASED \
 	    "Build against Slurm $(SLURM_VERSION)."; \
 	debuild -us -uc -G -i -tc
